@@ -303,7 +303,6 @@ int main(int argc, char *argv[]) {
 
         float *cembed = vocab_compact_embed(embed, &vm, DIM);
         float *gcembed = (float*)calloc((size_t)CV*DIM, 4);
-        AdamState acembed = adam_alloc((size_t)CV*DIM);
 
         // ===== Compile all kernels ONCE =====
         printf("Compiling 10 dynamic kernels (one-time)...\n");
@@ -367,7 +366,6 @@ int main(int argc, char *argv[]) {
         float *xnorm_buf = (float*)malloc(SEQ*DIM*4);
         float *logits = (float*)malloc(SEQ*CV*4);
         float *dlogits = (float*)malloc(SEQ*CV*4);
-        float *gate_buf = (float*)malloc(SEQ*HIDDEN*4);
         float *dh1 = (float*)malloc(SEQ*HIDDEN*4);
         float *dh3 = (float*)malloc(SEQ*HIDDEN*4);
         float *dsilu = (float*)malloc(SEQ*HIDDEN*4);
@@ -391,7 +389,7 @@ int main(int argc, char *argv[]) {
         srand48(42 + start_step);
 
         for (int step = start_step; step < total_steps; step++) {
-            uint64_t t0, t1, t_step = mach_absolute_time();
+            uint64_t t0, t_step = mach_absolute_time();
 
             // Sample data
             size_t max_pos = n_tokens - SEQ - 1;

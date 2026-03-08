@@ -7,7 +7,7 @@
 #import <IOSurface/IOSurface.h>
 
 static mach_timebase_info_data_t g_tb;
-static double ticksToMs(uint64_t t) { return (double)t * g_tb.numer / g_tb.denom / 1e6; }
+
 
 int main() {
     @autoreleasepool {
@@ -80,7 +80,6 @@ int main() {
         }
 
         // Also check for mlmodelc structure
-        NSString *aneDir = nil;
         en = [fm enumeratorAtPath:[compiled path]];
         while ((f = [en nextObject])) {
             if ([f hasSuffix:@".espresso.net"] || [f hasSuffix:@".hwx"] || [f hasSuffix:@".mil"]) {

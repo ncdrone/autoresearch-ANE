@@ -2,9 +2,9 @@
 # Requires: macOS 15+, Xcode command line tools, Apple Silicon
 
 CC = xcrun clang
-CFLAGS = -O2 -Wall -fobjc-arc
+CFLAGS = -O2 -Wall -Wno-unused-function -fobjc-arc -DACCELERATE_NEW_LAPACK
 FRAMEWORKS = -framework Foundation -framework IOSurface -framework CoreML -framework Accelerate
-LDFLAGS = -ldl -lobjc $(FRAMEWORKS)
+LDFLAGS = -ldl $(FRAMEWORKS)
 
 # Model selection: make MODEL=stories110m (or qwen3_06b, gpt_autoresearch)
 MODEL ?= gpt_autoresearch

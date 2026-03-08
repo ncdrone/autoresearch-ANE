@@ -14,11 +14,12 @@ NSData *buildWeightBlob(int ch, int depth) {
     NSUInteger chunkSize = 64 + wsize;
     NSUInteger total = 64 + chunkSize * depth;
     uint8_t *buf = calloc(total, 1);
-    buf[0] = 0x01; buf[4] = 0x02;
+    buf[0] = 1; buf[4] = 2;
     for (int i = 0; i < depth; i++) {
         uint8_t *chunk = buf + 64 + i * chunkSize;
-        chunk[0]=0xEF; chunk[1]=0xBE; chunk[2]=0xAD; chunk[3]=0xDE;
-        chunk[4]=0x01; chunk[10]=0x08;
+        chunk[0] = 0xEF; chunk[1] = 0xBE; chunk[2] = 0xAD; chunk[3] = 0xDE; chunk[4] = 1;
+        *(uint32_t*)(chunk+8) = (uint32_t)wsize;
+        *(uint32_t*)(chunk+16) = 64;
         uint16_t *fp16 = (uint16_t*)(chunk + 64);
         for (NSUInteger j = 0; j < wsize/2; j++) fp16[j] = (arc4random()&0x03FF)|0x2000;
     }

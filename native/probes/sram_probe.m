@@ -10,13 +10,13 @@ static double ticksToMs(uint64_t t) { return (double)t * g_tb.numer / g_tb.denom
 
 static NSData *buildWeightBlob(int ch) {
     NSUInteger wsize = (NSUInteger)ch * ch * 2;
-    NSUInteger total = 64 + 64 + wsize;
+    NSUInteger total = 128 + wsize;
     uint8_t *buf = calloc(total, 1);
-    buf[0] = 0x01; buf[4] = 0x02;
-    uint8_t *chunk = buf + 64;
-    chunk[0]=0xEF; chunk[1]=0xBE; chunk[2]=0xAD; chunk[3]=0xDE;
-    chunk[4]=0x01; chunk[10]=0x08;
-    uint16_t *fp16 = (uint16_t*)(chunk + 64);
+    buf[0] = 1; buf[4] = 2;
+    buf[64] = 0xEF; buf[65] = 0xBE; buf[66] = 0xAD; buf[67] = 0xDE; buf[68] = 1;
+    *(uint32_t*)(buf+72) = (uint32_t)wsize;
+    *(uint32_t*)(buf+80) = 128;
+    uint16_t *fp16 = (uint16_t*)(buf + 128);
     for (NSUInteger j = 0; j < (NSUInteger)ch * ch; j++)
         fp16[j] = (arc4random() & 0x03FF) | 0x2000;
     return [NSData dataWithBytesNoCopy:buf length:total freeWhenDone:YES];
