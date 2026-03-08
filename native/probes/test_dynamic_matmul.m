@@ -10,7 +10,7 @@
 #include <arm_neon.h>
 #include <Accelerate/Accelerate.h>
 
-#include "stories_io.h"
+#include "io.h"
 
 // Generate MIL for y = x @ W where both come from input IOSurface
 // Input: [1, IC, 1, SEQ+OC] fp32
