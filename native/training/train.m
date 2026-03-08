@@ -190,6 +190,9 @@ int main(int argc, char *argv[]) {
 
         bool do_resume = false, from_scratch = false;
         const char *data_path = DEFAULT_DATA_PATH;
+        const char *val_path = NULL;
+        int val_interval = 500;
+        int val_steps = 20;
         for (int i=1; i<argc; i++) {
             if (strcmp(argv[i], "--resume") == 0) do_resume = true;
             else if (strcmp(argv[i], "--scratch") == 0) from_scratch = true;
@@ -199,6 +202,9 @@ int main(int argc, char *argv[]) {
             else if (strcmp(argv[i], "--warmup") == 0 && i+1<argc) warmup_steps = atoi(argv[++i]);
             else if (strcmp(argv[i], "--clip") == 0 && i+1<argc) grad_clip = atof(argv[++i]);
             else if (strcmp(argv[i], "--data") == 0 && i+1<argc) data_path = argv[++i];
+            else if (strcmp(argv[i], "--val") == 0 && i+1<argc) val_path = argv[++i];
+            else if (strcmp(argv[i], "--val-interval") == 0 && i+1<argc) val_interval = atoi(argv[++i]);
+            else if (strcmp(argv[i], "--val-steps") == 0 && i+1<argc) val_steps = atoi(argv[++i]);
         }
         float lr = max_lr;
 
@@ -235,6 +241,8 @@ int main(int argc, char *argv[]) {
             printf("Params: %.1fM (transformer %.1fM + embed %.1fM)\n", xformer_m+embed_m, xformer_m, embed_m);
             printf("Kernels: 10 compiled (sdpaFwd+woFwd, ffnFused, ffnBwdW2t+W13t, wotBwd, sdpaBwd1+2, qBwd+kvBwd)\n");
             printf("Accum %d steps, LR=%g\n", accum_steps, max_lr);
+            if (val_path) printf("Val data: %s (every %d steps, %d forward passes)\n", val_path, val_interval, val_steps);
+            else printf("Val data: none (use --val <path> to enable)\n");
             double fwd_flops = 2.0*NLAYERS*((double)WQ_SZ + WK_SZ + WV_SZ + WO_SZ + W1_SZ + W2_SZ + W3_SZ) * SEQ;
             double total_flops = 3.0 * fwd_flops;
             printf("FLOPs/step: fwd=%.1fM total=%.1fM\n", fwd_flops/1e6, total_flops/1e6);
@@ -295,6 +303,24 @@ int main(int argc, char *argv[]) {
         if (token_data == MAP_FAILED) { printf("mmap failed\n"); return 1; }
         size_t n_tokens = data_len / 2;
         printf("Token data: %zu tokens (%.1f MB)\n", n_tokens, data_len/1e6);
+
+        // mmap validation data (optional)
+        uint16_t *val_data = NULL;
+        size_t val_n_tokens = 0;
+        if (val_path) {
+            int val_fd = open(val_path, O_RDONLY);
+            if (val_fd < 0) { printf("Cannot open val data: %s\n", val_path); }
+            else {
+                struct stat vst; fstat(val_fd, &vst);
+                size_t val_len = vst.st_size;
+                val_data = (uint16_t*)mmap(NULL, val_len, PROT_READ, MAP_PRIVATE, val_fd, 0);
+                if (val_data == MAP_FAILED) { printf("Val mmap failed\n"); val_data = NULL; }
+                else {
+                    val_n_tokens = val_len / 2;
+                    printf("Val data: %zu tokens (%.1f MB)\n", val_n_tokens, val_len/1e6);
+                }
+            }
+        }
 
         // Vocab compaction
         VocabMap vm = vocab_map_build(token_data, n_tokens, VOCAB);
@@ -742,6 +768,68 @@ int main(int argc, char *argv[]) {
                        step, loss, lr, step_ms, xmn, xmx, dmn, dmx);
             }
 
+            // Validation
+            if (val_data && step > 0 && step % val_interval == 0) {
+                float val_loss_sum = 0;
+                for (int vi = 0; vi < val_steps; vi++) {
+                    size_t vpos = (size_t)vi * (val_n_tokens / val_steps);
+                    if (vpos + SEQ + 1 > val_n_tokens) vpos = 0;
+                    uint16_t *vinput = val_data + vpos;
+                    uint16_t *vtarget_raw = val_data + vpos + 1;
+
+                    uint16_t vctargets[SEQ];
+                    for (int t = 0; t < SEQ; t++) vctargets[t] = (uint16_t)vm.full_to_compact[vtarget_raw[t]];
+
+                    // Forward pass (reuse x_cur, xnorm_buf, x_final, logits, dlogits)
+                    embed_lookup(x_cur, embed, vinput, DIM, SEQ);
+
+                    for (int L = 0; L < NLAYERS; L++) {
+                        rmsnorm(xnorm_buf, x_cur, lw[L].rms_att, DIM, SEQ);
+
+                        // Wait for any pending dW
+                        dispatch_group_wait(dw_grp, DISPATCH_TIME_FOREVER);
+
+                        // SDPA forward
+                        write_sdpa_fwd_acts(pls[L].sdpaFwd_in, xnorm_buf);
+                        ane_eval_req(dk.sdpaFwd, plr[L].sdpaFwd);
+                        IOSurfaceLock(dk.sdpaFwd->ioOut, kIOSurfaceLockReadOnly, NULL);
+                        _Float16 *vfwd_out = (_Float16*)IOSurfaceGetBaseAddress(dk.sdpaFwd->ioOut);
+                        float *vattn_out = acts[L].attn_out;
+                        cvt_f16_f32(vattn_out, vfwd_out, Q_DIM*SEQ);
+                        IOSurfaceUnlock(dk.sdpaFwd->ioOut, kIOSurfaceLockReadOnly, NULL);
+
+                        // Wo forward
+                        write_wo_fwd_acts(pls[L].woFwd_in, vattn_out);
+                        ane_eval_req(dk.woFwd, plr[L].woFwd);
+                        float *vo_out = acts[L].o_out;
+                        io_read_dyn(dk.woFwd->ioOut, vo_out, DIM, SEQ);
+
+                        // Residual + RMSNorm
+                        float *vx2 = acts[L].x2;
+                        vDSP_vsma(vo_out, 1, &res_alpha, x_cur, 1, vx2, 1, (vDSP_Length)(SEQ*DIM));
+                        float *vx2norm = acts[L].x2norm;
+                        rmsnorm(vx2norm, vx2, lw[L].rms_ffn, DIM, SEQ);
+
+                        // FFN forward
+                        write_ffn_fused_acts(pls[L].ffnFused_in, vx2norm, vx2);
+                        ane_eval_req(dk.ffnFused, plr[L].ffnFused);
+                        IOSurfaceLock(dk.ffnFused->ioOut, kIOSurfaceLockReadOnly, NULL);
+                        _Float16 *vffn_out = (_Float16*)IOSurfaceGetBaseAddress(dk.ffnFused->ioOut);
+                        cvt_f16_f32(x_cur, vffn_out, DIM*SEQ);
+                        IOSurfaceUnlock(dk.ffnFused->ioOut, kIOSurfaceLockReadOnly, NULL);
+                    }
+
+                    // Final RMSNorm + classifier + loss
+                    rmsnorm(x_final, x_cur, rms_final, DIM, SEQ);
+                    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                                CV, SEQ, DIM, 1.0f, cembed, DIM, x_final, SEQ, 0.0f, logits, SEQ);
+                    float vloss = cross_entropy_loss(dlogits, logits, vctargets, CV, SEQ);
+                    val_loss_sum += vloss;
+                }
+                float val_avg = val_loss_sum / val_steps;
+                printf("  [VAL step %d] val_loss=%.4f  val_bpt=%.4f\n", step, val_avg, val_avg / logf(2.0f));
+            }
+
             // Adam update every accum_steps
             if ((step+1) % accum_steps == 0 || step == total_steps-1) {
                 dispatch_group_wait(dw_grp, DISPATCH_TIME_FOREVER);
@@ -910,6 +998,7 @@ int main(int argc, char *argv[]) {
         free(dq_full); free(dk_full); free(dv_full);
         free(dq); free(dk_buf); free(dv);
         munmap(token_data, data_len); close(data_fd);
+        if (val_data) munmap(val_data, val_n_tokens * 2);
     }
     return 0;
 }

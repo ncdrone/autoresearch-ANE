@@ -22,14 +22,18 @@ ANE hardware profiling — 15 configs (NL={2,4,8,16,24} × SEQ={256,512,1024}).
 
 ### `sweep_5min/`
 ANE 5-minute training sweep with real climbmix data.
-- 5 candidate configs, each trained for ~5 minutes
+- 9 configs over 2 rounds, each trained for ~5 minutes
 - First real loss numbers on ANE with real data
-- Answers: which config is compute-optimal for ANE?
+- Winner: **NL=6, SEQ=512, 67.6M params, 99ms/step, smoothed loss 6.340**
+- Clear U-shaped depth curve at SEQ=512: NL=4 (6.74) → NL=6 (6.34) → NL=8 (6.94) → NL=10 (6.79) → NL=12 (7.14)
+- Key finding: more steps > bigger model (same as MPS)
 
 ## Key Numbers
 
-| System | Best val_bpb | Steps/5min | Tokens/run | Config |
-|--------|-------------|------------|------------|--------|
-| H100 (Karpathy) | 0.998 | 953 | 499.6M | D8, B128, S2048 |
-| M4 Max MPS | 1.309 | 393 | 25.8M | D4, B32, S2048 |
-| M4 Max ANE | TBD | TBD | TBD | TBD |
+| System | Params | ms/step | Steps/5min | Config |
+|--------|--------|---------|------------|--------|
+| H100 (Karpathy) | 50.3M | ~314ms | 953 | D8, B128, S2048 |
+| M4 Max MPS | 11.5M | 764ms | 393 | D4, B32, S2048 |
+| M4 Max ANE | 67.6M | 99ms | 3,000 | NL=6, SEQ=512 |
+
+ANE trains a 6x bigger model 8x faster than MPS on the same chip.

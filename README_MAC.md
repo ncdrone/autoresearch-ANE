@@ -170,6 +170,6 @@ This project continues the research started by maderix/ANE:
 
 ## Acknowledgments
 
+- [karpathy/autoresearch](https://github.com/karpathy/autoresearch) — The autonomous research framework and climbmix-400b dataset
 - [maderix/ANE](https://github.com/maderix/ANE) — Pioneering reverse-engineering of ANE for training. The `native/` directory is ported from this project.
-- [karpathy/autoresearch](https://github.com/karpathy/autoresearch) — The autonomous research framework
-- Apple Silicon hardware team — for building hardware that can do this even if the software doesn't expose it yet
+- [miolini/autoresearch-macos](https://github.com/miolini/autoresearch-macos) — macOS fork with Metal/MPS support that bridged Karpathy's CUDA code to Apple Silicon
