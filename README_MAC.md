@@ -1,150 +1,175 @@
-# autoresearch-ANE: Mac Silicon + Apple Neural Engine Edition
+# autoresearch-ANE: Apple Silicon Deep Research Edition
 
-Autonomous LLM pretraining research on Apple Silicon, adapted from [karpathy/autoresearch](https://github.com/karpathy/autoresearch) with Apple Neural Engine (ANE) integration inspired by [maderix/ANE](https://github.com/maderix/ANE).
+Autonomous LLM pretraining research on Apple Silicon, with direct Apple Neural Engine (ANE) access via ported [maderix/ANE](https://github.com/maderix/ANE) native code.
 
-## What's Different from Upstream
+**Goal**: Unlock the full compute potential of Apple Silicon by using ALL hardware units (ANE + GPU + CPU + AMX) for ML training, not just the GPU.
 
-| Feature | Original (CUDA) | This Fork (Mac Silicon) |
-|---------|-----------------|------------------------|
-| GPU Backend | CUDA (H100) | MPS (Metal Performance Shaders) |
-| Attention | Flash Attention 3 | PyTorch native SDPA |
-| Precision | bfloat16 | float16 (MPS native) |
-| Compilation | torch.compile | Eager mode (optional compile) |
-| Inference | GPU | ANE via CoreML |
-| Memory | GPU VRAM (80GB H100) | Unified Memory (up to 192GB) |
+## What's Here
+
+This project has two layers:
+
+1. **Python training** (`train_mac.py`) — Standard PyTorch MPS training, works today
+2. **Native ANE research** (`native/`) — Ported Objective-C code for direct ANE hardware access, probing, and experimental training
 
 ## Quick Start
 
+### Training (works now)
 ```bash
-# 1. Set up dependencies (on your Mac)
-cp pyproject_mac.toml pyproject.toml
-pip install uv
-uv sync
-
-# 2. Prepare data (downloads ~1GB of training data)
+cp pyproject_mac.toml pyproject.toml && uv sync
 uv run prepare.py --num-shards 8
-
-# 3. Train on Mac Silicon (MPS backend)
 uv run train_mac.py
+```
 
-# 4. Convert to CoreML for ANE inference
-uv run convert_to_coreml.py
+### ANE Research (requires macOS on Apple Silicon)
+```bash
+# Build everything
+cd native && make all
 
-# 5. Run inference on ANE
-uv run ane_inference.py --prompt "Once upon a time"
+# Quick test: verify ANE hardware access
+make test-ane
+
+# Probe ANE SRAM size (find the performance cliff)
+make bench-sram
+
+# Test dynamic weights (can we avoid recompilation?)
+make bench-weights
+
+# Or use Python harness
+cd .. && python ane_benchmark.py --all
 ```
 
 ## Architecture
 
 ### Training: MPS Backend (`train_mac.py`)
 
-Training uses PyTorch's MPS (Metal Performance Shaders) backend, which runs on the Apple Silicon GPU. Key adaptations:
+| Feature | CUDA (Original) | Mac Silicon (This Fork) |
+|---------|-----------------|------------------------|
+| GPU | NVIDIA H100 | Apple Silicon GPU (MPS) |
+| Attention | Flash Attention 3 | PyTorch native SDPA |
+| Precision | bfloat16 | float16 |
+| Memory | 80GB VRAM | Up to 192GB unified |
 
-- **Flash Attention 3 → native SDPA**: PyTorch's `scaled_dot_product_attention` works on MPS and auto-selects the best kernel
-- **bfloat16 → float16**: MPS has full float16 support; bfloat16 is limited
-- **No torch.compile**: MPS compilation support is evolving; eager mode is reliable
-- **Unified memory**: Your 128GB is shared between CPU and GPU — no separate VRAM limit!
+### ANE Research: Native Code (`native/`)
 
-### Inference: ANE via CoreML (`ane_inference.py`)
+The `native/` directory contains ported and adapted code from [maderix/ANE](https://github.com/maderix/ANE) — the project that proved ANE hardware can do ML training, not just inference.
 
-For inference, we convert the trained model to CoreML format. CoreML automatically dispatches operations to the most efficient compute unit:
+#### Key Breakthrough: Dynamic Weights
 
-- **ANE**: Matrix multiplications, normalizations, activations (~70% of ops)
-- **GPU**: Complex operations ANE doesn't support
-- **CPU**: Fallback for remaining ops
+The original maderix/ANE project achieved only 5-9% ANE utilization because weights were baked into compiled kernels. Every optimizer step required recompiling ~60 kernels (~3.7s overhead).
 
-### Direct ANE Access (`ane_bridge.py`)
+The `training_dynamic/` pipeline solves this: **weights are packed into the input IOSurface alongside activations**. Kernels compile ONCE at startup. Weight updates are just memcpy to shared memory.
 
-Experimental module inspired by [maderix/ANE](https://github.com/maderix/ANE) that provides:
+```
+Static pipeline:  compile(W) → eval(x) → update(W) → RECOMPILE(W) → eval(x) → ...
+Dynamic pipeline: compile()  → write(x,W) → eval() → write(x,W') → eval() → ...
+```
 
-- ANE hardware detection and capability reporting
-- MIL (Model Intermediate Language) program generation
-- Performance estimation and backend comparison
-- Reference for building native ANE training loops
+#### Native Directory Structure
 
-## Compute Backends Compared
+```
+native/
+├── bridge/              # Python-callable C interface via ctypes
+│   ├── ane_bridge.h     # C API header
+│   └── ane_bridge.m     # Obj-C implementation
+├── runtime/             # Core ANE interface
+│   ├── ane_runtime.h    # dlopen + compile + IOSurface + eval
+│   ├── config.h         # Model structs, derived sizes, ANE init
+│   └── io.h             # IOSurface I/O, NEON f16/f32 conversion
+├── mil/                 # MIL (Model Intermediate Language) code generation
+│   ├── mil_dynamic.h    # Dynamic weight kernels (the breakthrough)
+│   └── ane_mil_gen.h    # Static weight kernels (reference)
+├── training/            # ANE training loop
+│   ├── train.m          # Dynamic weight training (compile-once)
+│   ├── cpu_ops.h        # CPU: RMSNorm, Adam, cross-entropy (Accelerate)
+│   └── models/          # Model configs
+│       ├── gpt_autoresearch.h  # Our GPT config
+│       ├── stories110m.h       # Stories110M (Llama2-style)
+│       └── qwen3_06b.h         # Qwen3-0.6B (GQA)
+├── probes/              # Hardware exploration and benchmarks
+│   ├── sram_bench.m     # Probe ANE SRAM size
+│   ├── sram_probe.m     # Fine-grained SRAM probing
+│   ├── api_exploration.m        # Discover private ANE APIs
+│   ├── test_weight_patch.m      # 6 approaches to avoid recompilation
+│   ├── test_weight_reload.m     # Unload/reload weight test
+│   ├── test_dynamic_matmul.m    # Dynamic matmul benchmark
+│   ├── inmem_basic.m    # Basic in-memory compilation test
+│   ├── inmem_bench.m    # In-memory compilation benchmark
+│   └── inmem_peak.m     # Peak throughput measurement
+└── Makefile             # Build system
+```
 
-### For Training
+## Python Interface
 
-| Backend | TFLOPS | Maturity | Ease of Use |
-|---------|--------|----------|-------------|
-| **MPS (GPU)** | 7-30 (chip dependent) | Stable | High — standard PyTorch |
-| **ANE (direct)** | 11-76 TOPS (5-9% util.) | Experimental | Low — Obj-C, private APIs |
-| **CPU** | ~1-2 | Stable | High — always works |
+### `ane_bridge.py` — Real ctypes bridge
 
-**Recommendation**: Use MPS for training. ANE direct training (maderix/ANE approach) achieves only 5-9% of peak throughput due to CPU-ANE data transfer overhead.
+```python
+from ane_bridge import ANEBridge
 
-### For Inference
+bridge = ANEBridge()
+print(bridge.get_info())  # Hardware detection always works
 
-| Backend | Throughput | Power Efficiency | Ease of Use |
-|---------|-----------|-----------------|-------------|
-| **CoreML/ANE** | Good | Excellent | Medium — needs conversion |
-| **MPS (GPU)** | Good | Good | High — use model directly |
-| **CPU** | Fair | Fair | High — always works |
+if bridge.native_available:
+    # Generate dynamic matmul MIL (weights via IOSurface, no recompile)
+    mil = ANEBridge.gen_dynamic_matmul_mil(ic=768, oc=768, seq=256)
 
-**Recommendation**: Use CoreML/ANE for inference deployment. It's power-efficient and handles dispatch automatically.
+    # Compile once, use forever
+    kernel = bridge.compile_kernel(mil, input_sizes=[...], output_sizes=[...])
 
-## Model Size Guide (128GB Unified Memory)
+    # Pack activations + weights into input, eval on ANE
+    bridge.write_input(kernel, 0, packed_data)
+    bridge.eval(kernel)
+    output = bridge.read_output(kernel, 0, output_bytes)
+```
 
-With 128GB, you can train much larger models than typical GPU setups:
+### `ane_benchmark.py` — Probe everything
 
-| DEPTH | Params | Model Memory | Optimizer Memory | Total ~Est. | Status |
-|-------|--------|-------------|-----------------|-------------|--------|
-| 8 | 50M | 0.1 GB | 0.3 GB | ~1 GB | Default, trains fast |
-| 16 | 200M | 0.4 GB | 1.2 GB | ~3 GB | Good sweet spot |
-| 24 | 450M | 0.9 GB | 2.7 GB | ~6 GB | Comfortable |
-| 32 | 800M | 1.6 GB | 4.8 GB | ~10 GB | Still easy |
-| 48 | 1.8B | 3.6 GB | 10.8 GB | ~22 GB | Ambitious |
-| 64 | 3.2B | 6.4 GB | 19.2 GB | ~40 GB | Feasible on 128GB! |
+```bash
+python ane_benchmark.py --basic     # Verify ANE access
+python ane_benchmark.py --sram      # Find SRAM performance cliff
+python ane_benchmark.py --dynamic   # Test dynamic weight strategies
+python ane_benchmark.py --compare   # ANE vs MPS vs CPU
+python ane_benchmark.py --explore   # Discover private APIs
+python ane_benchmark.py --all       # Run everything
+```
 
-To change model size, edit `DEPTH` in `train_mac.py`. The model dimension scales as `depth * ASPECT_RATIO`.
+## Research Questions
 
-## ANE Deep Dive
+This project continues the research started by maderix/ANE:
 
-### How the ANE Works (from maderix/ANE research)
+1. **SRAM boundaries**: Where exactly does ANE performance cliff? How does this vary by chip (M1 vs M4)?
+2. **Dynamic weight overhead**: How much throughput do we lose by packing weights into IOSurface vs constants?
+3. **Weight reload API**: Does `_ANEWeight` + `weightsBuffer` in `_ANERequest` work for runtime weight swapping?
+4. **Memory scan patching**: Can we find and patch compiled weights in process memory?
+5. **Multi-unit pipeline**: Can we pipeline ANE + GPU + CPU + AMX to exceed any single unit's throughput?
+6. **Compilation limit**: What causes the ~119 compile limit? Is there a cleanup API?
+7. **Undiscovered ops**: What ANE operations exist beyond what's been tested?
 
-The Apple Neural Engine is a dedicated hardware accelerator in Apple Silicon:
+## Apple Silicon Compute Units
 
-- **Interface**: Private `_ANEClient` API, not publicly documented
-- **Programs**: Compiled from MIL (Model Intermediate Language) text
-- **Data format**: IOSurface shared memory, `[1, C, 1, S]` layout, float16
-- **Per-step kernels** (for a transformer layer):
-  1. `kFwdAttn` — RMSNorm + QKV + SDPA + output projection
-  2. `kFwdFFN` — RMSNorm + SwiGLU
-  3. `kFFNBwd` — FFN backward
-  4. `kSdpaBwd1/2` — Attention backward (2 parts)
-  5. `kQKVb` — QKV backward
-- **CPU offload**: RMSNorm backward, residuals, loss, weight gradients (cblas), Adam
+| Unit | Peak (M4 Max) | Used For (Currently) | Potential |
+|------|---------------|---------------------|-----------|
+| **ANE** | 38 TOPS | CoreML inference only | Training (proven by maderix/ANE) |
+| **GPU** | 15.2 TFLOPS | MPS training | Could pipeline with ANE |
+| **CPU** | P+E cores | Everything else | Accelerate/vDSP for element-wise |
+| **AMX** | ~2 TFLOPS | BLAS calls | Matrix operations without GPU |
 
-### Current ANE Limitations
-
-- ~5-9% of peak TOPS utilization during training
-- No native causal masking in ANE SDPA
-- ~119 compile limit per process (resource leak)
-- Element-wise ops fall back to CPU
-- Private API — may break across macOS versions
-
-### Future Possibilities
-
-- Apple may expose training-friendly ANE APIs in future macOS/Xcode releases
-- CoreML improvements could enable training via the public API
-- MLX (Apple's ML framework) may add ANE dispatch
-- Community work on maderix/ANE may improve utilization
+**The opportunity**: Today's ML frameworks use GPU only. With 128GB unified memory and 4 compute units sharing the same address space, Apple Silicon should be able to exceed GPU-only throughput.
 
 ## Files
 
 | File | Purpose |
 |------|---------|
-| `train_mac.py` | Training script for Mac Silicon (MPS backend) |
-| `convert_to_coreml.py` | Convert trained model to CoreML for ANE |
-| `ane_inference.py` | Run inference using CoreML/ANE |
-| `ane_bridge.py` | Experimental direct ANE access + hardware info |
-| `pyproject_mac.toml` | macOS-compatible dependencies |
-| `prepare.py` | Data preparation (device-agnostic, works on Mac) |
-| `train.py` | Original CUDA training script (upstream reference) |
+| `train_mac.py` | PyTorch MPS training (production) |
+| `ane_bridge.py` | Python ctypes bridge to native ANE code |
+| `ane_benchmark.py` | Benchmark suite for all compute units |
+| `ane_inference.py` | CoreML inference on ANE |
+| `convert_to_coreml.py` | PyTorch → CoreML model conversion |
+| `native/` | Ported maderix/ANE Objective-C code |
+| `prepare.py` | Data preparation (read-only) |
+| `train.py` | Original CUDA training (upstream reference) |
 
 ## Acknowledgments
 
-- [karpathy/autoresearch](https://github.com/karpathy/autoresearch) — the brilliant autonomous research framework
-- [maderix/ANE](https://github.com/maderix/ANE) — pioneering reverse-engineering of Apple Neural Engine training
-- The PyTorch MPS backend team at Apple
+- [maderix/ANE](https://github.com/maderix/ANE) — Pioneering reverse-engineering of ANE for training. The `native/` directory is ported from this project.
+- [karpathy/autoresearch](https://github.com/karpathy/autoresearch) — The autonomous research framework
+- Apple Silicon hardware team — for building hardware that can do this even if the software doesn't expose it yet

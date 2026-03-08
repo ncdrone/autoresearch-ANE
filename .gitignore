@@ -18,3 +18,14 @@ AGENTS.md
 
 # Experimental code/artifacts
 dev/
+
+# Native build output (rebuild on target machine)
+native/build/
+
+# CoreML model artifacts
+*.mlpackage
+*.mlmodelc
+
+# Checkpoint files
+*.pt
+*.bin
