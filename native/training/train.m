@@ -187,6 +187,8 @@ int main(int argc, char *argv[]) {
         float loss_scale = 256.0f;
         float res_alpha = 1.0f / sqrtf(2.0f * NLAYERS);
         float min_lr_frac = 0.1f;
+        float embed_lr_scale = 5.0f;    // embeddings learn faster
+        float matrix_lr_scale = 0.05f;  // weight matrices learn slower
 
         bool do_resume = false, from_scratch = false;
         const char *data_path = DEFAULT_DATA_PATH;
@@ -207,6 +209,8 @@ int main(int argc, char *argv[]) {
             else if (strcmp(argv[i], "--val-interval") == 0 && i+1<argc) val_interval = atoi(argv[++i]);
             else if (strcmp(argv[i], "--val-steps") == 0 && i+1<argc) val_steps = atoi(argv[++i]);
             else if (strcmp(argv[i], "--token-bytes") == 0 && i+1<argc) token_bytes_path = argv[++i];
+            else if (strcmp(argv[i], "--wd") == 0 && i+1<argc) wd = atof(argv[++i]);
+            else if (strcmp(argv[i], "--beta2") == 0 && i+1<argc) adam_b2 = atof(argv[++i]);
         }
         float lr = max_lr;
 
@@ -276,9 +280,9 @@ int main(int argc, char *argv[]) {
                     for(size_t i=0;i<WQ_SZ;i++) lw[L].Wq[i]=scale_d*(2*drand48()-1);
                     for(size_t i=0;i<WK_SZ;i++) lw[L].Wk[i]=scale_d*(2*drand48()-1);
                     for(size_t i=0;i<WV_SZ;i++) lw[L].Wv[i]=scale_d*(2*drand48()-1);
-                    for(size_t i=0;i<WO_SZ;i++) lw[L].Wo[i]=scale_qd*res_scale*(2*drand48()-1);
+                    for(size_t i=0;i<WO_SZ;i++) lw[L].Wo[i]=0.0f;
                     for(size_t i=0;i<W1_SZ;i++) lw[L].W1[i]=scale_h*(2*drand48()-1);
-                    for(size_t i=0;i<W2_SZ;i++) lw[L].W2[i]=scale_d*res_scale*(2*drand48()-1);
+                    for(size_t i=0;i<W2_SZ;i++) lw[L].W2[i]=0.0f;
                     for(size_t i=0;i<W3_SZ;i++) lw[L].W3[i]=scale_h*(2*drand48()-1);
                     for(int i=0;i<DIM;i++){lw[L].rms_att[i]=1.0f; lw[L].rms_ffn[i]=1.0f;}
                 }
@@ -534,11 +538,36 @@ int main(int argc, char *argv[]) {
             t0 = mach_absolute_time();
             cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
                         CV, SEQ, DIM, 1.0f, cembed, DIM, x_final, SEQ, 0.0f, logits, SEQ);
+            // Logit softcapping: cap * tanh(logits / cap) — prevents explosion
+            {
+                float cap = 15.0f;
+                float inv_cap = 1.0f / cap;
+                int n_logits = CV * SEQ;
+                vDSP_vsmul(logits, 1, &inv_cap, logits, 1, (vDSP_Length)n_logits);
+                int nn = n_logits;
+                vvtanhf(logits, logits, &nn);
+                vDSP_vsmul(logits, 1, &cap, logits, 1, (vDSP_Length)n_logits);
+            }
             float loss = cross_entropy_loss(dlogits, logits, ctargets, CV, SEQ);
             t_cls += tb_ms(mach_absolute_time() - t0);
             last_loss = loss;
 
             // ===== BACKWARD =====
+            // Softcapping backward: dlogits *= (1 - tanh²(logits_raw / cap))
+            // logits now = cap*tanh(x/cap), so tanh(x/cap) = logits/cap
+            {
+                float cap = 15.0f;
+                float inv_cap = 1.0f / cap;
+                int n_logits = CV * SEQ;
+                float *tanh_vals = (float*)malloc(n_logits * 4);
+                vDSP_vsmul(logits, 1, &inv_cap, tanh_vals, 1, (vDSP_Length)n_logits);  // tanh(x/cap) = logits/cap
+                // dtanh = 1 - tanh²
+                vDSP_vmul(tanh_vals, 1, tanh_vals, 1, tanh_vals, 1, (vDSP_Length)n_logits);  // tanh²
+                float neg1 = -1.0f, one = 1.0f;
+                vDSP_vsmsa(tanh_vals, 1, &neg1, &one, tanh_vals, 1, (vDSP_Length)n_logits);  // 1 - tanh²
+                vDSP_vmul(dlogits, 1, tanh_vals, 1, dlogits, 1, (vDSP_Length)n_logits);
+                free(tanh_vals);
+            }
             vDSP_vsmul(dlogits, 1, &loss_scale, dlogits, 1, (vDSP_Length)(SEQ*CV));
 
             // Classifier backward
@@ -956,16 +985,18 @@ int main(int argc, char *argv[]) {
                     lr = min_lr + 0.5f * (1.0f + cosf(M_PI * decay_ratio)) * (max_lr - min_lr);
                 }
 
-                // Adam update
+                // Adam update (separate LRs for matrices, norms, embeddings)
+                float mlr = lr * matrix_lr_scale;
+                float elr = lr * embed_lr_scale;
                 for (int L=0; L<NLAYERS; L++) {
                     LayerGrads *g = &grads[L];
-                    adam_update(lw[L].Wq, g->Wq, &la[L].Wq, adam_t, lr, adam_b1, adam_b2, adam_eps, wd);
-                    adam_update(lw[L].Wk, g->Wk, &la[L].Wk, adam_t, lr, adam_b1, adam_b2, adam_eps, wd);
-                    adam_update(lw[L].Wv, g->Wv, &la[L].Wv, adam_t, lr, adam_b1, adam_b2, adam_eps, wd);
-                    adam_update(lw[L].Wo, g->Wo, &la[L].Wo, adam_t, lr, adam_b1, adam_b2, adam_eps, wd);
-                    adam_update(lw[L].W1, g->W1, &la[L].W1, adam_t, lr, adam_b1, adam_b2, adam_eps, wd);
-                    adam_update(lw[L].W2, g->W2, &la[L].W2, adam_t, lr, adam_b1, adam_b2, adam_eps, wd);
-                    adam_update(lw[L].W3, g->W3, &la[L].W3, adam_t, lr, adam_b1, adam_b2, adam_eps, wd);
+                    adam_update(lw[L].Wq, g->Wq, &la[L].Wq, adam_t, mlr, adam_b1, adam_b2, adam_eps, wd);
+                    adam_update(lw[L].Wk, g->Wk, &la[L].Wk, adam_t, mlr, adam_b1, adam_b2, adam_eps, wd);
+                    adam_update(lw[L].Wv, g->Wv, &la[L].Wv, adam_t, mlr, adam_b1, adam_b2, adam_eps, wd);
+                    adam_update(lw[L].Wo, g->Wo, &la[L].Wo, adam_t, mlr, adam_b1, adam_b2, adam_eps, wd);
+                    adam_update(lw[L].W1, g->W1, &la[L].W1, adam_t, mlr, adam_b1, adam_b2, adam_eps, wd);
+                    adam_update(lw[L].W2, g->W2, &la[L].W2, adam_t, mlr, adam_b1, adam_b2, adam_eps, wd);
+                    adam_update(lw[L].W3, g->W3, &la[L].W3, adam_t, mlr, adam_b1, adam_b2, adam_eps, wd);
                     adam_update(lw[L].rms_att, g->rms_att, &la[L].rms_att, adam_t, lr, adam_b1, adam_b2, adam_eps, 0.0f);
                     adam_update(lw[L].rms_ffn, g->rms_ffn, &la[L].rms_ffn, adam_t, lr, adam_b1, adam_b2, adam_eps, 0.0f);
 
@@ -989,7 +1020,7 @@ int main(int argc, char *argv[]) {
                     stage_kv_bwd_weights(pls[L].kvBwd_in, lw[L].Wk, lw[L].Wv);
                 }
                 adam_update(rms_final, grms_final, &arms_final, adam_t, lr, adam_b1, adam_b2, adam_eps, 0.0f);
-                adam_update(embed, gembed, &aembed, adam_t, lr, adam_b1, adam_b2, adam_eps, wd);
+                adam_update(embed, gembed, &aembed, adam_t, elr, adam_b1, adam_b2, adam_eps, 0.0f);
                 free(cembed);
                 cembed = vocab_compact_embed(embed, &vm, DIM);
 

@@ -17,8 +17,8 @@ results/logs_*/
 results/sweep_5min/
 results/mps_pretest/*.log
 
-# Viz — generated PNGs (regenerate from scripts, keep .py)
-viz/*.png
+# Viz — all viz content (scripts + generated PNGs)
+viz/
 
 # Agent prompt files (generated per-session by launchers)
 CLAUDE.md
